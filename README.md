@@ -1,6 +1,6 @@
-# PixyGarden Disc 1 Translation Toolkit
+# Pixygarden Disc 1 Translation Toolkit
 
-This toolkit collects the latest Disc 1 scripts used for editing and translating PixyGarden.
+This toolkit collects the latest Disc 1 scripts used for editing and translating the game disc of Pixygarden (PS1) by Escot and ImageWorks.
 
 The `tools/` directory contains the original working scripts. These scripts remain directly runnable and are the preferred entry points when exact script behavior is required.
 
