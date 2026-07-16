@@ -3,6 +3,7 @@ from __future__ import annotations
 
 # v35 broadens the PLANET/Modus FT4/opening-frame element repair: accepts small X drift, matches already-patched element U aliases, and replaces older FT4 source hooks automatically.
 # v36 updates REPORT text bytes: Pixies/Objects spacing and MODUS -> MODI.
+# v133 fixes the complete 42-entry Pixy rename table: all name pointers stay original, every name is written as eight full-width CP932 glyph cells plus four zero bytes, and name rows are excluded from every relocation pass.
 # v37 makes REPORT_TEXT_PATCH_BYTES an explicit full 120-byte block, including final MODI MADE null padding.
 # v40 rolls back v39 steady/template X normalization after it shifted other element graphics; keeps the narrow FT4/source flicker repair. FT4 X adjust default is 0.
 # v38 normalizes PLANET/Modus FT4 opening element X to prevent the final 2-4px left snap.
@@ -58,6 +59,31 @@ HEAP_EXPECT=bytes.fromhex("1180043c d00f8424")
 GP_X=0x538; GP_Y=0x53C; GP_START_X=0x524; GP_HADV=0x50; GP_VADV=0x54
 SECTIONS=[("rdata",0x80020000,0x800288FC),("text",0x800288FC,0x800CCC54),("data",0x800CCC54,0x800DA4FC),("sdata",0x800DA4FC,0x800DA898),("sbss",0x800DA898,0x800DAED8),("bss",0x800DAED8,0x80110FD0)]
 REG={"zero":0,"at":1,"v0":2,"v1":3,"a0":4,"a1":5,"a2":6,"a3":7,"t0":8,"t1":9,"t2":10,"t3":11,"t4":12,"t5":13,"t6":14,"t7":15,"s0":16,"s1":17,"s2":18,"s3":19,"s4":20,"s5":21,"s6":22,"s7":23,"t8":24,"t9":25,"gp":28,"sp":29,"fp":30,"ra":31}
+
+# Pixy rename-screen name table.
+#
+# The screen's lookup loop consumes exactly eight CP932 halfwords. Each original
+# record is therefore:
+#   0x10 bytes = eight two-byte glyph cells (name padded with CP932 spaces)
+#   0x04 bytes = zero padding
+# The 42 pointer entries immediately follow the fixed-width records.
+NAME_SCREEN_SLOT_RAM_START = 0x80023300
+NAME_SCREEN_SLOT_SIZE = 0x14
+NAME_SCREEN_GLYPH_BYTES = 0x10
+NAME_SCREEN_TRAILING_ZERO_BYTES = 0x04
+NAME_SCREEN_ENTRY_COUNT = 42
+NAME_SCREEN_PTR_FILE_START = 0x3E48
+NAME_SCREEN_PTR_STRIDE = 0x04
+NAME_SCREEN_PTR_OFFSETS = tuple(
+    NAME_SCREEN_PTR_FILE_START + i * NAME_SCREEN_PTR_STRIDE
+    for i in range(NAME_SCREEN_ENTRY_COUNT)
+)
+NAME_SCREEN_SLOT_POINTERS = tuple(
+    NAME_SCREEN_SLOT_RAM_START + i * NAME_SCREEN_SLOT_SIZE
+    for i in range(NAME_SCREEN_ENTRY_COUNT)
+)
+NAME_SCREEN_DEFAULT_EXCLUDE_SPEC = ",".join(f"0x{x:X}" for x in NAME_SCREEN_PTR_OFFSETS)
+NAME_SCREEN_DEFAULT_ROW_SPEC = "233-274"
 
 def s16(x): x&=0xffff; return x-0x10000 if x&0x8000 else x
 def hi(addr): return ((addr+0x8000)>>16)&0xffff
@@ -4728,13 +4754,153 @@ def apply_auto_ptr32_excludes(cands,offsets,label="auto_exclude"):
             })
     return changed
 
+
+def is_name_screen_row(row):
+    """True when a spreadsheet row maps to one of the 42 fixed name slots."""
+    delta = row.old_ptr - NAME_SCREEN_SLOT_RAM_START
+    return (
+        0 <= delta < NAME_SCREEN_ENTRY_COUNT * NAME_SCREEN_SLOT_SIZE
+        and delta % NAME_SCREEN_SLOT_SIZE == 0
+    )
+
+def apply_name_screen_ptr32_excludes(cands, extra_offsets=None):
+    """Exclude every relocation candidate that references a fixed name slot.
+
+    The explicit pointer-table offsets are also honored for compatibility, but
+    matching by original target pointer protects duplicate references too.
+    """
+    extra_offsets = set(extra_offsets or [])
+    protected_ptrs = set(NAME_SCREEN_SLOT_POINTERS)
+    protected_offsets = set(NAME_SCREEN_PTR_OFFSETS) | extra_offsets
+    changed = []
+    for c in cands:
+        if c.row.old_ptr not in protected_ptrs and c.off not in protected_offsets:
+            continue
+        was_selected = c.selected
+        c.selected = False
+        c.reason += (";" if c.reason else "") + "name_screen_table_protected"
+        changed.append({
+            "candidate_id": c.cid,
+            "was_selected": int(was_selected),
+            "file_offset": f"0x{c.off:X}",
+            "ram_address": f"0x{c.ram:08X}",
+            "section": c.section,
+            "sheet_row": c.row.sheet_row,
+            "old_pointer": f"0x{c.row.old_ptr:08X}",
+            "new_pointer": f"0x{c.row.new_ptr:08X}",
+            "text_preview": c.row.text[:120],
+        })
+    return changed
+
+def patch_name_screen_table(
+    exe,
+    rows,
+    load,
+    requested_rows=None,
+    body_encoding="cp932_fullwidth",
+    fill_mode="fixed_cp932_name8",
+    dry_run=False,
+):
+    """Restore and rewrite the complete 42-entry Pixy rename table safely.
+
+    Name records are detected by original RAM address rather than relying on
+    spreadsheet row numbers. This keeps the fix working if workbook rows move.
+    """
+    if body_encoding != "cp932_fullwidth":
+        raise RuntimeError(
+            "The rename table requires two-byte CP932 glyphs. "
+            "Use --name-screen-inplace-body-encoding cp932_fullwidth."
+        )
+    if fill_mode not in {"fixed_cp932_name8", "fixed_cp932_space"}:
+        raise RuntimeError(
+            "The rename table requires eight CP932 glyph cells plus four zero bytes. "
+            "Use --name-screen-inplace-fill fixed_cp932_name8."
+        )
+
+    requested_rows = set(requested_rows or [])
+    by_ptr = {r.old_ptr: r for r in rows if is_name_screen_row(r)}
+    missing = [ptr for ptr in NAME_SCREEN_SLOT_POINTERS if ptr not in by_ptr]
+    if missing:
+        preview = ", ".join(f"0x{x:08X}" for x in missing[:8])
+        more = "" if len(missing) <= 8 else f" (+{len(missing)-8} more)"
+        raise RuntimeError(
+            "Could not find all 42 Pixy-name spreadsheet rows by original pointer. "
+            f"Missing: {preview}{more}"
+        )
+
+    report = []
+    for i, ptr in enumerate(NAME_SCREEN_SLOT_POINTERS):
+        row = by_ptr[ptr]
+        text = norm(row.text)
+        try:
+            body = to_fullwidth_ascii_text(text).encode("cp932", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(
+                f"Name table entry {i} / sheet row {row.sheet_row} is not CP932 encodable: {text!r}"
+            ) from exc
+
+        if len(body) % 2:
+            raise RuntimeError(
+                f"Name table entry {i} / sheet row {row.sheet_row} encoded to an odd byte count "
+                f"({len(body)}). The table requires two-byte glyphs only: {text!r}"
+            )
+        if len(body) > NAME_SCREEN_GLYPH_BYTES:
+            raise RuntimeError(
+                f"Name table entry {i} / sheet row {row.sheet_row} is too long: "
+                f"{len(body)//2} glyphs; maximum is {NAME_SCREEN_GLYPH_BYTES//2}. Text={text!r}"
+            )
+
+        glyph_pad = b"\x81\x40" * ((NAME_SCREEN_GLYPH_BYTES - len(body)) // 2)
+        new_slot = body + glyph_pad + (b"\x00" * NAME_SCREEN_TRAILING_ZERO_BYTES)
+        if len(new_slot) != NAME_SCREEN_SLOT_SIZE:
+            raise AssertionError("Internal rename-table slot size mismatch")
+
+        ptr_off = NAME_SCREEN_PTR_OFFSETS[i]
+        slot_off = ram2off(ptr, load)
+        if ptr_off < 0 or ptr_off + 4 > len(exe):
+            raise RuntimeError(f"Rename pointer entry {i} maps outside EXE at 0x{ptr_off:X}")
+        if slot_off < 0 or slot_off + NAME_SCREEN_SLOT_SIZE > len(exe):
+            raise RuntimeError(f"Rename name slot {i} maps outside EXE at 0x{slot_off:X}")
+
+        old_ptr = read32(exe, ptr_off)
+        old_slot = bytes(exe[slot_off:slot_off + NAME_SCREEN_SLOT_SIZE])
+        if not dry_run:
+            struct.pack_into("<I", exe, ptr_off, ptr)
+            exe[slot_off:slot_off + NAME_SCREEN_SLOT_SIZE] = new_slot
+
+        report.append({
+            "sheet_row": row.sheet_row,
+            "status": "would_patch" if dry_run else "patched",
+            "file_offset": f"0x{ptr_off:X}",
+            "ram_address": f"0x{off2ram(ptr_off, load):08X}",
+            "old_pointer": f"0x{old_ptr:08X}",
+            "new_pointer": f"0x{ptr:08X}",
+            "old_offset": f"0x{slot_off:X}",
+            "slot_len": NAME_SCREEN_SLOT_SIZE,
+            "encoded_len": len(body),
+            "body_encoding": body_encoding,
+            "fill": "8_cp932_glyphs_plus_4_zero_bytes",
+            "text_preview": text[:180],
+            "old_preview": old_slot.hex(" "),
+            "new_preview": new_slot.hex(" "),
+            "requested_by_row_spec": int(not requested_rows or row.sheet_row in requested_rows),
+        })
+
+    return {
+        "enabled": True,
+        "status": "would_patch" if dry_run else "patched",
+        "entries": NAME_SCREEN_ENTRY_COUNT,
+        "rows": sorted(r.sheet_row for r in by_ptr.values()),
+        "report": report,
+    }
+
+
 def patch_inplace_rows(exe,rows,row_nums,fill_mode="normal_zero",body_encoding="ascii",dry_run=False):
     """Patch selected spreadsheet rows at their original string slots.
 
-    This is intentionally optional. The confirmed name-screen-critical fix is
-    excluding ptr32 file offset 0x3E48 so the Aries/name table keeps its
-    original pointer. In-place row patching is only for experiments where you
-    want that original slot translated too.
+    This generic helper remains available for non-table experiments. The Pixy
+    rename screen itself now uses patch_name_screen_table(), which protects all
+    42 pointers and preserves the native eight-glyph-plus-four-zero layout.
 
     body_encoding values:
       ascii              use the normal one-byte ASCII insertion encoding
@@ -6955,11 +7121,11 @@ def main():
     ap.add_argument("--ptr32-ranges-json"); ap.add_argument("--ptr32-include-offsets"); ap.add_argument("--ptr32-exclude-offsets")
     ap.add_argument("--ptr32-slice-count",type=int,default=1); ap.add_argument("--ptr32-slice-index",type=int,default=0)
     ap.add_argument("--align-strings",type=int,default=4)
-    ap.add_argument("--disable-name-screen-fix",action="store_true",help="Disable the confirmed PixyGarden name-change-screen fix")
-    ap.add_argument("--name-screen-exclude-offsets",default="0x3E48",help="Inline ptr32 file offsets to force-exclude for the name-screen fix. Default: 0x3E48")
-    ap.add_argument("--name-screen-inplace-rows",default="",help="Spreadsheet rows to patch in-place for excluded name-screen pointers. Default: empty (leave Aries original/untranslated). Use 233 to patch Aries.")
-    ap.add_argument("--name-screen-inplace-fill",choices=["normal_zero","normal_space","fixed_ascii_space","fixed_cp932_space"],default="fixed_cp932_space",help="How to fill unused bytes for optional in-place name-screen rows. Default: fixed_cp932_space, but no rows are patched unless --name-screen-inplace-rows is set.")
-    ap.add_argument("--name-screen-inplace-body-encoding",choices=["ascii","cp932_fullwidth"],default="cp932_fullwidth",help="Encoding for optional in-place name-screen rows. cp932_fullwidth keeps two-byte fixed-width name-table glyphs; default: cp932_fullwidth.")
+    ap.add_argument("--disable-name-screen-fix",action="store_true",help="Disable the complete 42-entry Pixy rename-screen table fix")
+    ap.add_argument("--name-screen-exclude-offsets",default=NAME_SCREEN_DEFAULT_EXCLUDE_SPEC,help="Additional ptr32 file offsets to protect. The complete 42-entry table is protected automatically.")
+    ap.add_argument("--name-screen-inplace-rows",default=NAME_SCREEN_DEFAULT_ROW_SPEC,help="Expected workbook rows for the 42 Pixy names (default: 233-274). Records are actually detected by original pointer, so shifted workbook rows remain safe.")
+    ap.add_argument("--name-screen-inplace-fill",choices=["fixed_cp932_name8","fixed_cp932_space"],default="fixed_cp932_name8",help="Rename-table layout. Both accepted values write eight two-byte CP932 glyph cells followed by four zero bytes.")
+    ap.add_argument("--name-screen-inplace-body-encoding",choices=["cp932_fullwidth"],default="cp932_fullwidth",help="Required encoding for the fixed rename table: full-width CP932.")
     ap.add_argument("--disable-tree-text-buffer-patch",action="store_true",help="Disable the TREE.CDF details text stack-buffer/copy-limit patch")
     ap.add_argument("--tree-copy-limit",type=lambda x:int(x,0),default=0x1FA,help="TREE details TXT copy byte limit. Original is 0xFA; default patch value is 0x1FA")
     ap.add_argument("--tree-buffer-force",action="store_true",help="Patch TREE buffer sites even if current words are not original/compatible")
@@ -7050,22 +7216,44 @@ def main():
     cands=collect_ptr32(orig,rows,load); cluster(cands,args.ptr32_cluster_gap); select(cands,args)
     name_fix_excludes=[]
     name_fix_inplace_report=[]
+    name_fix_info={"enabled":False,"status":"disabled","report":[]}
+    protected_name_rows=set()
     if not args.disable_name_screen_fix:
-        name_fix_excludes=apply_auto_ptr32_excludes(cands,parse_int_set(args.name_screen_exclude_offsets),label="name_screen_fix_exclude")
+        protected_name_rows={r.sheet_row for r in rows if is_name_screen_row(r)}
+        name_fix_excludes=apply_name_screen_ptr32_excludes(
+            cands,
+            parse_int_set(args.name_screen_exclude_offsets),
+        )
     lui_total=0
     if not args.no_lui:
         for row in rows:
+            if row.sheet_row in protected_name_rows:
+                continue
             lui_total+=patch_lui(exe,row.old_ptr,row.new_ptr)
     direct_report=[]
     if not args.skip_direct_mips:
         include_rows=parse_row_ranges(args.direct_mips_rows)
         exclude_rows=parse_row_ranges(args.direct_mips_exclude_rows) or set()
-        scan_rows=[r for r in rows if (include_rows is None or r.sheet_row in include_rows) and r.sheet_row not in exclude_rows]
+        scan_rows=[
+            r for r in rows
+            if (include_rows is None or r.sheet_row in include_rows)
+            and r.sheet_row not in exclude_rows
+            and r.sheet_row not in protected_name_rows
+        ]
         direct_hits=scan_direct_mips(orig,scan_rows,code_start=args.direct_mips_code_start,code_end=args.direct_mips_code_end,maxgap=args.direct_mips_max_gap,confidence=args.direct_mips_confidence,lifetime=not args.direct_mips_no_lifetime_aware)
         direct_report=patch_direct_mips(exe,direct_hits,dry_run=args.dry_run,strict=not args.non_strict_direct_mips)
     ptr_total=apply_ptr32(exe,cands)
     if not args.disable_name_screen_fix:
-        name_fix_inplace_report=patch_inplace_rows(exe,rows,parse_row_ranges(args.name_screen_inplace_rows) or set(),fill_mode=args.name_screen_inplace_fill,body_encoding=args.name_screen_inplace_body_encoding,dry_run=args.dry_run)
+        name_fix_info=patch_name_screen_table(
+            exe,
+            rows,
+            load,
+            requested_rows=parse_row_ranges(args.name_screen_inplace_rows) or set(),
+            body_encoding=args.name_screen_inplace_body_encoding,
+            fill_mode=args.name_screen_inplace_fill,
+            dry_run=args.dry_run,
+        )
+        name_fix_inplace_report=name_fix_info.get("report",[])
     selector_gsbox_hook_info={"enabled":False,"status":"disabled","report":[]}
     clear_data_selector_y_info={"enabled":False,"status":"disabled","report":[]}
     report_text_info={"enabled":False,"status":"disabled"}
@@ -7181,7 +7369,7 @@ def main():
             for rec in direct_report:
                 wri.writerow({k:rec.get(k,"") for k in fields})
         with nr.open("w",encoding="utf-8-sig",newline="") as f:
-            fields=["record_type","candidate_id","was_selected","file_offset","ram_address","section","sheet_row","old_pointer","new_pointer","status","old_offset","slot_len","encoded_len","fill","body_encoding","text_preview","old_preview","new_preview"]
+            fields=["record_type","candidate_id","was_selected","file_offset","ram_address","section","sheet_row","old_pointer","new_pointer","status","old_offset","slot_len","encoded_len","fill","body_encoding","text_preview","old_preview","new_preview","requested_by_row_spec"]
             wri=csv.DictWriter(f,fieldnames=fields); wri.writeheader()
             for rec in name_fix_excludes:
                 row={k:"" for k in fields}; row.update(rec); row["record_type"]="ptr32_exclude"; wri.writerow(row)
@@ -7214,7 +7402,7 @@ def main():
             write_pixy_name_suffix_report_csv(psr, pixy_name_suffix_info.get("report", []))
         if selector_gsbox_hook_info.get("enabled"):
             write_selector_gsbox_hook_report_csv(sgr, selector_gsbox_hook_info.get("report", []))
-        summary={"input":str(args.exe),"output":str(args.out),"rows":len(rows),"memory_card_centering":{k:v for k,v in memory_card_centering_info.items() if k != "report"},"memory_card_centering_report_rows":len(memory_card_centering_info.get("report",[])),"pixy_name_suffix_spacing":{k:v for k,v in pixy_name_suffix_info.items() if k != "report"},"pixy_name_suffix_spacing_report_rows":len(pixy_name_suffix_info.get("report",[])),"selector_gsbox_hook":{k:v for k,v in selector_gsbox_hook_info.items() if k != "report"},"selector_gsbox_hook_report_rows":len(selector_gsbox_hook_info.get("report",[])),"clear_data_selector_y":{k:v for k,v in clear_data_selector_y_info.items() if k != "report"},"clear_data_selector_y_report":clear_data_selector_y_info.get("report",[]),"old_file_size":len(orig),"new_file_size":len(exe),"old_payload":old_payload,"new_payload":new_payload,"ascii_table_ram":f"0x{table:08X}","ascii_stub_ram":f"0x{stub:08X}","ascii_xoff_table_ram":f"0x{xoff_table:08X}","pool_start_off":f"0x{pool:X}","pool_start_ram":f"0x{off2ram(pool,load):08X}","unpadded_size":unpadded,"loaded_end":f"0x{loaded_end:08X}","heap_base_minus4":f"0x{heap:08X}","legacy_lui_patches":lui_total,"direct_mips_sites":len(direct_report),"direct_mips_patched":sum(1 for r in direct_report if r.get("status") in {"patched","would_patch"}),"direct_mips_already_patched":sum(1 for r in direct_report if r.get("status")=="already_patched"),"direct_mips_errors":sum(1 for r in direct_report if r.get("status")=="error"),"direct_mips_confidence":args.direct_mips_confidence,"ptr32_policy":args.ptr32_policy,"ptr32_candidates_total":len(cands),"ptr32_selected_total":sum(1 for c in cands if c.selected),"ptr32_patches":ptr_total,"ptr32_cluster_gap":args.ptr32_cluster_gap,"ptr32_cluster_min":args.ptr32_cluster_min,"ptr32_cluster_unique_min":args.ptr32_cluster_unique_min,"ptr32_sections":args.ptr32_sections,"ptr32_slice_count":args.ptr32_slice_count,"ptr32_slice_index":args.ptr32_slice_index,"name_screen_fix_enabled":not args.disable_name_screen_fix,"name_screen_ptr32_excludes":len(name_fix_excludes),"name_screen_inplace_rows":len(name_fix_inplace_report),"advance_groups":{"7":args.advance7_chars,"6":args.advance6_chars,"5":args.advance5_chars,"9":args.advance9_chars,"8":args.advance8_chars,"3":args.advance3_chars,"2":args.advance2_chars,"10":args.advance10_chars,"4":args.advance4_chars},"v75_final_spacing_lock":None if (args.disable_v74_final_spacing_lock or args.disable_v75_final_spacing_lock) else DEFAULT_V75_FINAL_ADVANCE_OVERRIDES,"effective_sample_advances":{"I":build_advance_table(args)[ord("I")],"i":build_advance_table(args)[ord("i")],"l":build_advance_table(args)[ord("l")],"p":build_advance_table(args)[ord("p")],"m":build_advance_table(args)[ord("m")],"M":build_advance_table(args)[ord("M")],"R":build_advance_table(args)[ord("R")],"P":build_advance_table(args)[ord("P")],"u":build_advance_table(args)[ord("u")],"w":build_advance_table(args)[ord("w")],"period":build_advance_table(args)[ord(".")],"z":build_advance_table(args)[ord("z")]} ,"font_tim_metrics":load_v76_font_tim_metrics(args),"x_offsets":{"left2":args.xoff_left2_chars,"left1":args.xoff_left1_chars,"right3":args.xoff_right3_chars,"right2":args.xoff_right2_chars,"right1":args.xoff_right1_chars,"draw_shift":args.draw_shift,"v75_final":iter_v75_final_xoff_map(args),"pair_kern":iter_v75_pair_kern_map(args)},"capital_r_advance_delta":args.capital_r_advance_delta,"uppercase_advance_delta":args.uppercase_advance_delta,"hyphen_advance_delta":args.hyphen_advance_delta,"slash_advance_delta":args.slash_advance_delta,"paren_advance":args.paren_advance,"slash_fixed_advance":args.slash_fixed_advance,"space_advance":args.space_advance,"punct_advance":args.punct_advance,"two_byte_advance_legacy_unused":args.two_byte_advance,"nonlatin_cp932_spacing":"original_parser","tree_text_buffer_patch_enabled":tree_buffer_info.get("enabled",False),"tree_copy_limit":f"0x{tree_buffer_info.get('copy_limit',0):X}" if tree_buffer_info.get("enabled") else None,"tree_clear_size":f"0x{tree_buffer_info.get('clear_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_frame_size":f"0x{tree_buffer_info.get('frame_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_terminator_patch_enabled":tree_terminator_info.get("enabled",False),"tree_terminator":tree_terminator_info.get("terminator") if tree_terminator_info.get("enabled") else "0x39","planet_stage_terminator_patch_enabled":planet_stage_terminator_info.get("enabled",False),"planet_stage_terminator":planet_stage_terminator_info.get("terminator") if planet_stage_terminator_info.get("enabled") else "0x39","plsel_graphic_draw_patch_enabled":plsel_graphic_draw_info.get("enabled",False),"plsel_graphic_draw_patch_sites":len(plsel_graphic_draw_info.get("report",[])),"plsel_graphic_draw_patch_report":plsel_graphic_draw_info.get("report",[]),"planet_title_ram_hook_enabled":planet_title_info.get("enabled",False),"planet_title_ram_hook_status":planet_title_info.get("status"),"planet_title_ram_hook_site":planet_title_info.get("site_file"),"planet_title_ram_hook_addr":planet_title_info.get("hook_ram"),"planet_title_ram_hook_titles":" | ".join(planet_title_info.get("titles",[])) if planet_title_info.get("titles") else None,"planet_title_ram_hook_text_area":{"x":planet_title_info.get("text_x"),"y":planet_title_info.get("title_y"),"w":planet_title_info.get("text_w"),"slot_h":planet_title_info.get("slot_h"),"slot_pitch":planet_title_info.get("slot_pitch")} if planet_title_info.get("enabled") else None,"planet_info_element_draw_patch_enabled":planet_info_element_info.get("enabled",False),"planet_info_element_draw_patch_status":planet_info_element_info.get("status"),"planet_info_element_draw_patch_hook":planet_info_element_info.get("hook_ram"),"planet_info_element_draw_patch_report":planet_info_element_info.get("report",[]),"planet_copy_slot_split_hook":planet_copy_slot_split_info,"stage_tim03_moved_uv_patch":stage_tim03_uv_info,"stage_tim04_na_packet_filter_hook":stage_tim04_na_packet_filter_info,"stage_tim04_na_ft4_edge_filter_hook":stage_tim04_na_ft4_edge_filter_info,"stage_tim04_na_ft4_source_filter_hook":stage_tim04_na_ft4_source_filter_info,"stage_tim04_na_template_u_hook":stage_tim04_na_template_u_info,"modus_local_record_early_fix_hook":modus_local_record_early_fix_info,"modus_local_record_fix_hook":modus_local_record_fix_info,"stage_tim04_object_overlay_na_x":args.stage_tim04_object_overlay_na_x,"modus_plmenu01_uvs":{"Earth":"visible x=25 w=23; padded U=0x18 W=0x19","Water":"visible x=50 w=24; padded U=0x31 W=0x1A","Wind":"visible x=76 w=19; padded U=0x4B W=0x15","Fire":"visible x=97 w=18; padded U=0x60 W=0x14"},"modus_plmenu01_ft4_uvs":{"Earth":"U=0x19 W=0x17","Water":"U=0x32 W=0x18","Wind":"U=0x4C W=0x13","Fire":"U=0x61 W=0x12"},"modus_ft4_x_tolerance":args.modus_stage_ft4_x_tolerance,"modus_ft4_source_aliases":"v35 matches stock, steady padded, and FT4 visible U values","ft4_opening_repairs_v43":"Object Overlay relocation-only old-U->edited-U/W/X; PLANET/Modus element first-UV/edge repairs mirror stable template values","modus_exact_ft4_edge_read_hooks":modus_exact_ft4_edge_read_info,"stage_tim04_object_overlay_base_x":args.stage_tim04_object_overlay_base_x,"tuto21_flow":tuto21_info,"planet_info_planet_clut":args.planet_info_planet_clut,"planet_title_tracking":args.planet_title_tracking,"planet_title_bitmap_metrics_enabled":planet_title_use_bitmap_metrics(args),"planet_title_bitmap_tracking":args.planet_title_bitmap_tracking,"planet_title_space_advance":args.planet_title_space_advance,"planet_title_advance_delta":args.planet_title_advance_delta,"planet_title_advance_override":args.planet_title_advance_override,"report_text_patch_enabled":report_text_info.get("enabled",False),"report_text_patch_status":report_text_info.get("status"),"report_text_patch_offset":report_text_info.get("file_offset"),"text_primitive_capacity_patch_enabled":text_primitive_info.get("enabled",False),"text_primitive_capacity_glyphs":text_primitive_info.get("capacity_glyphs"),"text_primitive_half_size":f"0x{text_primitive_info.get('half_size',0):X}" if text_primitive_info.get("enabled") else None,"text_primitive_alloc_size":f"0x{text_primitive_info.get('alloc_size',0):X}" if text_primitive_info.get("enabled") else None}
+        summary={"input":str(args.exe),"output":str(args.out),"rows":len(rows),"memory_card_centering":{k:v for k,v in memory_card_centering_info.items() if k != "report"},"memory_card_centering_report_rows":len(memory_card_centering_info.get("report",[])),"pixy_name_suffix_spacing":{k:v for k,v in pixy_name_suffix_info.items() if k != "report"},"pixy_name_suffix_spacing_report_rows":len(pixy_name_suffix_info.get("report",[])),"selector_gsbox_hook":{k:v for k,v in selector_gsbox_hook_info.items() if k != "report"},"selector_gsbox_hook_report_rows":len(selector_gsbox_hook_info.get("report",[])),"clear_data_selector_y":{k:v for k,v in clear_data_selector_y_info.items() if k != "report"},"clear_data_selector_y_report":clear_data_selector_y_info.get("report",[]),"old_file_size":len(orig),"new_file_size":len(exe),"old_payload":old_payload,"new_payload":new_payload,"ascii_table_ram":f"0x{table:08X}","ascii_stub_ram":f"0x{stub:08X}","ascii_xoff_table_ram":f"0x{xoff_table:08X}","pool_start_off":f"0x{pool:X}","pool_start_ram":f"0x{off2ram(pool,load):08X}","unpadded_size":unpadded,"loaded_end":f"0x{loaded_end:08X}","heap_base_minus4":f"0x{heap:08X}","legacy_lui_patches":lui_total,"direct_mips_sites":len(direct_report),"direct_mips_patched":sum(1 for r in direct_report if r.get("status") in {"patched","would_patch"}),"direct_mips_already_patched":sum(1 for r in direct_report if r.get("status")=="already_patched"),"direct_mips_errors":sum(1 for r in direct_report if r.get("status")=="error"),"direct_mips_confidence":args.direct_mips_confidence,"ptr32_policy":args.ptr32_policy,"ptr32_candidates_total":len(cands),"ptr32_selected_total":sum(1 for c in cands if c.selected),"ptr32_patches":ptr_total,"ptr32_cluster_gap":args.ptr32_cluster_gap,"ptr32_cluster_min":args.ptr32_cluster_min,"ptr32_cluster_unique_min":args.ptr32_cluster_unique_min,"ptr32_sections":args.ptr32_sections,"ptr32_slice_count":args.ptr32_slice_count,"ptr32_slice_index":args.ptr32_slice_index,"name_screen_fix_enabled":not args.disable_name_screen_fix,"name_screen_ptr32_excludes":len(name_fix_excludes),"name_screen_inplace_rows":len(name_fix_inplace_report),"name_screen_table_entries":name_fix_info.get("entries",0),"name_screen_slot_format":"8 CP932 glyph halfwords + 4 zero bytes" if name_fix_info.get("enabled") else None,"advance_groups":{"7":args.advance7_chars,"6":args.advance6_chars,"5":args.advance5_chars,"9":args.advance9_chars,"8":args.advance8_chars,"3":args.advance3_chars,"2":args.advance2_chars,"10":args.advance10_chars,"4":args.advance4_chars},"v75_final_spacing_lock":None if (args.disable_v74_final_spacing_lock or args.disable_v75_final_spacing_lock) else DEFAULT_V75_FINAL_ADVANCE_OVERRIDES,"effective_sample_advances":{"I":build_advance_table(args)[ord("I")],"i":build_advance_table(args)[ord("i")],"l":build_advance_table(args)[ord("l")],"p":build_advance_table(args)[ord("p")],"m":build_advance_table(args)[ord("m")],"M":build_advance_table(args)[ord("M")],"R":build_advance_table(args)[ord("R")],"P":build_advance_table(args)[ord("P")],"u":build_advance_table(args)[ord("u")],"w":build_advance_table(args)[ord("w")],"period":build_advance_table(args)[ord(".")],"z":build_advance_table(args)[ord("z")]} ,"font_tim_metrics":load_v76_font_tim_metrics(args),"x_offsets":{"left2":args.xoff_left2_chars,"left1":args.xoff_left1_chars,"right3":args.xoff_right3_chars,"right2":args.xoff_right2_chars,"right1":args.xoff_right1_chars,"draw_shift":args.draw_shift,"v75_final":iter_v75_final_xoff_map(args),"pair_kern":iter_v75_pair_kern_map(args)},"capital_r_advance_delta":args.capital_r_advance_delta,"uppercase_advance_delta":args.uppercase_advance_delta,"hyphen_advance_delta":args.hyphen_advance_delta,"slash_advance_delta":args.slash_advance_delta,"paren_advance":args.paren_advance,"slash_fixed_advance":args.slash_fixed_advance,"space_advance":args.space_advance,"punct_advance":args.punct_advance,"two_byte_advance_legacy_unused":args.two_byte_advance,"nonlatin_cp932_spacing":"original_parser","tree_text_buffer_patch_enabled":tree_buffer_info.get("enabled",False),"tree_copy_limit":f"0x{tree_buffer_info.get('copy_limit',0):X}" if tree_buffer_info.get("enabled") else None,"tree_clear_size":f"0x{tree_buffer_info.get('clear_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_frame_size":f"0x{tree_buffer_info.get('frame_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_terminator_patch_enabled":tree_terminator_info.get("enabled",False),"tree_terminator":tree_terminator_info.get("terminator") if tree_terminator_info.get("enabled") else "0x39","planet_stage_terminator_patch_enabled":planet_stage_terminator_info.get("enabled",False),"planet_stage_terminator":planet_stage_terminator_info.get("terminator") if planet_stage_terminator_info.get("enabled") else "0x39","plsel_graphic_draw_patch_enabled":plsel_graphic_draw_info.get("enabled",False),"plsel_graphic_draw_patch_sites":len(plsel_graphic_draw_info.get("report",[])),"plsel_graphic_draw_patch_report":plsel_graphic_draw_info.get("report",[]),"planet_title_ram_hook_enabled":planet_title_info.get("enabled",False),"planet_title_ram_hook_status":planet_title_info.get("status"),"planet_title_ram_hook_site":planet_title_info.get("site_file"),"planet_title_ram_hook_addr":planet_title_info.get("hook_ram"),"planet_title_ram_hook_titles":" | ".join(planet_title_info.get("titles",[])) if planet_title_info.get("titles") else None,"planet_title_ram_hook_text_area":{"x":planet_title_info.get("text_x"),"y":planet_title_info.get("title_y"),"w":planet_title_info.get("text_w"),"slot_h":planet_title_info.get("slot_h"),"slot_pitch":planet_title_info.get("slot_pitch")} if planet_title_info.get("enabled") else None,"planet_info_element_draw_patch_enabled":planet_info_element_info.get("enabled",False),"planet_info_element_draw_patch_status":planet_info_element_info.get("status"),"planet_info_element_draw_patch_hook":planet_info_element_info.get("hook_ram"),"planet_info_element_draw_patch_report":planet_info_element_info.get("report",[]),"planet_copy_slot_split_hook":planet_copy_slot_split_info,"stage_tim03_moved_uv_patch":stage_tim03_uv_info,"stage_tim04_na_packet_filter_hook":stage_tim04_na_packet_filter_info,"stage_tim04_na_ft4_edge_filter_hook":stage_tim04_na_ft4_edge_filter_info,"stage_tim04_na_ft4_source_filter_hook":stage_tim04_na_ft4_source_filter_info,"stage_tim04_na_template_u_hook":stage_tim04_na_template_u_info,"modus_local_record_early_fix_hook":modus_local_record_early_fix_info,"modus_local_record_fix_hook":modus_local_record_fix_info,"stage_tim04_object_overlay_na_x":args.stage_tim04_object_overlay_na_x,"modus_plmenu01_uvs":{"Earth":"visible x=25 w=23; padded U=0x18 W=0x19","Water":"visible x=50 w=24; padded U=0x31 W=0x1A","Wind":"visible x=76 w=19; padded U=0x4B W=0x15","Fire":"visible x=97 w=18; padded U=0x60 W=0x14"},"modus_plmenu01_ft4_uvs":{"Earth":"U=0x19 W=0x17","Water":"U=0x32 W=0x18","Wind":"U=0x4C W=0x13","Fire":"U=0x61 W=0x12"},"modus_ft4_x_tolerance":args.modus_stage_ft4_x_tolerance,"modus_ft4_source_aliases":"v35 matches stock, steady padded, and FT4 visible U values","ft4_opening_repairs_v43":"Object Overlay relocation-only old-U->edited-U/W/X; PLANET/Modus element first-UV/edge repairs mirror stable template values","modus_exact_ft4_edge_read_hooks":modus_exact_ft4_edge_read_info,"stage_tim04_object_overlay_base_x":args.stage_tim04_object_overlay_base_x,"tuto21_flow":tuto21_info,"planet_info_planet_clut":args.planet_info_planet_clut,"planet_title_tracking":args.planet_title_tracking,"planet_title_bitmap_metrics_enabled":planet_title_use_bitmap_metrics(args),"planet_title_bitmap_tracking":args.planet_title_bitmap_tracking,"planet_title_space_advance":args.planet_title_space_advance,"planet_title_advance_delta":args.planet_title_advance_delta,"planet_title_advance_override":args.planet_title_advance_override,"report_text_patch_enabled":report_text_info.get("enabled",False),"report_text_patch_status":report_text_info.get("status"),"report_text_patch_offset":report_text_info.get("file_offset"),"text_primitive_capacity_patch_enabled":text_primitive_info.get("enabled",False),"text_primitive_capacity_glyphs":text_primitive_info.get("capacity_glyphs"),"text_primitive_half_size":f"0x{text_primitive_info.get('half_size',0):X}" if text_primitive_info.get("enabled") else None,"text_primitive_alloc_size":f"0x{text_primitive_info.get('alloc_size',0):X}" if text_primitive_info.get("enabled") else None}
         sj.write_text(json.dumps(summary,indent=2),encoding="utf-8")
     print("PixyGarden conservative namefix patch summary")
     print("----------------------------------------")
@@ -7230,7 +7418,8 @@ def main():
     print(f"PTR32 selected/patched:  {ptr_total}")
     if not args.disable_name_screen_fix:
         print(f"Name fix ptr32 excludes: {len(name_fix_excludes)}")
-        print(f"Name fix in-place rows:  {len(name_fix_inplace_report)}")
+        print(f"Name table entries fixed: {len(name_fix_inplace_report)} / {NAME_SCREEN_ENTRY_COUNT}")
+        print("Name slot format:         8 CP932 glyphs + 4 zero bytes")
     if tree_buffer_info.get("enabled"):
         print(f"TREE copy limit:         0x{tree_buffer_info['copy_limit']:X}")
         print(f"TREE frame size:         0x{tree_buffer_info['frame_size']:X}")
