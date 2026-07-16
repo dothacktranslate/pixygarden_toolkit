@@ -4,6 +4,8 @@ from __future__ import annotations
 # v35 broadens the PLANET/Modus FT4/opening-frame element repair: accepts small X drift, matches already-patched element U aliases, and replaces older FT4 source hooks automatically.
 # v36 updates REPORT text bytes: Pixies/Objects spacing and MODUS -> MODI.
 # v133 fixes the complete 42-entry Pixy rename table: all name pointers stay original, every name is written as eight full-width CP932 glyph cells plus four zero bytes, and name rows are excluded from every relocation pass.
+# v135 completes the live-name fix: translated save data stores Pixy names as one-byte ASCII. The wrapper now migrates the actual 18-byte live name field to eight native full-width CP932 cells plus a null halfword before the original rename-screen initializer runs. This prevents mixed CP932/ASCII names after the user selects a character. Existing CP932 names pass through unchanged.
+# v136 fixes non-Latin CP932/Japanese spacing in compact text contexts such as the Pixy name select list. The custom renderer now assigns --two-byte-advance explicitly before drawing every non-Latin two-byte glyph instead of inheriting the previous Latin glyph advance.
 # v37 makes REPORT_TEXT_PATCH_BYTES an explicit full 120-byte block, including final MODI MADE null padding.
 # v40 rolls back v39 steady/template X normalization after it shifted other element graphics; keeps the narrow FT4/source flicker repair. FT4 X adjust default is 0.
 # v38 normalizes PLANET/Modus FT4 opening element X to prevent the final 2-4px left snap.
@@ -84,6 +86,17 @@ NAME_SCREEN_SLOT_POINTERS = tuple(
 )
 NAME_SCREEN_DEFAULT_EXCLUDE_SPEC = ",".join(f"0x{x:X}" for x in NAME_SCREEN_PTR_OFFSETS)
 NAME_SCREEN_DEFAULT_ROW_SPEC = "233-274"
+
+# Runtime rename-screen initializer. The original routine at 0x800403A8 reads
+# exactly eight CP932 halfwords. Translated live/save names are ordinary ASCII,
+# so the first lhu sees pairs such as 0x694D ("Mi") and its 16x16 glyph search
+# never succeeds. v135 patches the single caller to a wrapper that converts
+# legacy ASCII names into a temporary stack buffer, copies the native eight-cell
+# result back into the live 18-byte name field, and then calls the original
+# initializer. Native CP932 names created by the in-game editor bypass it.
+NAME_SCREEN_RUNTIME_CALL_SITE = 0x80040A34
+NAME_SCREEN_RUNTIME_ORIGINAL_TARGET = 0x800403A8
+NAME_SCREEN_RUNTIME_ORIGINAL_CALL_WORD = 0x0C0100EA  # jal 0x800403A8
 
 def s16(x): x&=0xffff; return x-0x10000 if x&0x8000 else x
 def hi(addr): return ((addr+0x8000)>>16)&0xffff
@@ -3827,10 +3840,17 @@ def build_stub(stub,table,adv_table,xoff_table,args):
     a.lab("db_mapped")
     emit_cp932_word_to_a0(a); load_adv_from_index(a,adv_table,"t2","t1"); load_xoff_from_index(a,xoff_table,"t2","t3"); emit_v75_pair_kern_twobyte(a,args); a.j("store2"); a.nop()
     a.lab("db_default")
-    # Non-Latin CP932 / Japanese text should keep the game's original two-byte
-    # parser and original full-width spacing. The fallback path reloads v0/v1
-    # and jumps back into the original code path.
-    a.j("fallback"); a.nop()
+    # Non-Latin CP932 / Japanese glyphs use the original glyph decoder, but the
+    # original parser does not assign GP_HADV for each two-byte character; it
+    # merely reuses the value left by the current text context or previous glyph.
+    # That is normally 12 px in the rename display box, but can be a compact
+    # Latin advance in list views, causing Japanese names to collapse together.
+    # Set an explicit native full-width advance and clear any stale draw bearing
+    # before entering the common two-byte draw path.
+    emit_cp932_word_to_a0(a)
+    a.ori("t1","zero",int(args.two_byte_advance)&0xff)
+    a.addu("t3","zero","zero")
+    a.j("store2"); a.nop()
 
     # Store paths. t1 = normal advance, t3 = signed draw X offset.
     # If t3 != 0, temporarily shift GP_X for this glyph, then compensate
@@ -4892,6 +4912,193 @@ def patch_name_screen_table(
         "entries": NAME_SCREEN_ENTRY_COUNT,
         "rows": sorted(r.sheet_row for r in by_ptr.values()),
         "report": report,
+    }
+
+
+
+def build_name_screen_runtime_ascii_wrapper(hook_ram):
+    """Build a PS1-safe wrapper for the original rename-screen initializer.
+
+    Input arguments are unchanged:
+      a0/a1 = draw coordinates
+      a2    = live Pixy-name buffer
+
+    Native CP932 names (first byte >= 0x80) tail-jump directly to the original
+    routine. Legacy ASCII names are converted into eight CP932 halfwords in a
+    temporary stack buffer, then copied back into the actual 18-byte live name
+    field as:
+
+      0x00..0x0F = eight native CP932 glyph cells
+      0x10..0x11 = zero terminator halfword
+
+    Updating the live field is necessary because the editor writes selected
+    characters directly into that field. A temporary-only conversion would
+    leave the untouched suffix in ASCII, producing a mixed CP932/ASCII string
+    after the first edit and hanging the lookup loop again.
+
+    Supported legacy characters are A-Z, a-z, 0-9, and space; any other
+    one-byte value becomes a full-width space.
+    """
+    a = A(hook_ram)
+
+    # Native two-byte CP932 names already use the format expected by the game.
+    a.lbu("t0", 0, "a2")
+    a.sltiu("t1", "t0", 0x80)
+    a.bne("t1", "zero", "ascii_name"); a.nop()
+    a.j(NAME_SCREEN_RUNTIME_ORIGINAL_TARGET); a.nop()
+
+    a.lab("ascii_name")
+    # 0x00..0x0F: eight converted halfwords
+    # 0x10: saved original live-name pointer
+    # 0x2C: saved wrapper return address
+    a.addiu("sp", "sp", -0x30)
+    a.sw("ra", 0x2C, "sp")
+    a.sw("a2", 0x10, "sp")
+    a.addu("t0", "a2", "zero")       # source ASCII byte pointer
+    a.addu("t1", "sp", "zero")       # temporary halfword destination
+    a.addiu("t2", "zero", 8)
+
+    a.lab("convert_loop")
+    a.lbu("t3", 0, "t0")
+    a.addiu("t0", "t0", 1)
+    a.beq("t3", "zero", "emit_space"); a.nop()
+
+    # ASCII digit 0-9 -> CP932 full-width ０-９ (82 4F..58).
+    a.addiu("t4", "t3", -0x30)
+    a.sltiu("t5", "t4", 10)
+    a.bne("t5", "zero", "emit_digit"); a.nop()
+
+    # ASCII uppercase A-Z -> CP932 full-width Ａ-Ｚ (82 60..79).
+    a.addiu("t4", "t3", -0x41)
+    a.sltiu("t5", "t4", 26)
+    a.bne("t5", "zero", "emit_upper"); a.nop()
+
+    # ASCII lowercase a-z -> CP932 full-width ａ-ｚ (82 81..9A).
+    a.addiu("t4", "t3", -0x61)
+    a.sltiu("t5", "t4", 26)
+    a.bne("t5", "zero", "emit_lower"); a.nop()
+
+    # ASCII space and unsupported bytes both become CP932 full-width space.
+    a.addiu("t4", "t3", -0x20)
+    a.beq("t4", "zero", "emit_space"); a.nop()
+
+    a.lab("emit_space")
+    a.addiu("t4", "zero", 0x4081)     # bytes 81 40
+    a.j("store_glyph"); a.nop()
+
+    a.lab("emit_digit")
+    a.addiu("t4", "t4", 0x4F)
+    a.sll("t4", "t4", 8)
+    a.ori("t4", "t4", 0x82)
+    a.j("store_glyph"); a.nop()
+
+    a.lab("emit_upper")
+    a.addiu("t4", "t4", 0x60)
+    a.sll("t4", "t4", 8)
+    a.ori("t4", "t4", 0x82)
+    a.j("store_glyph"); a.nop()
+
+    a.lab("emit_lower")
+    a.addiu("t4", "t4", 0x81)
+    a.sll("t4", "t4", 8)
+    a.ori("t4", "t4", 0x82)
+
+    a.lab("store_glyph")
+    a.word(it(0x29, REG["t1"], REG["t4"], 0))  # sh t4,0(t1)
+    a.addiu("t1", "t1", 2)
+    a.addiu("t2", "t2", -1)
+    a.bne("t2", "zero", "convert_loop"); a.nop()
+
+    # Copy the complete native eight-cell name back to the live name field.
+    # This field is 0x12 bytes: 0x10 glyph bytes plus a zero halfword.
+    a.lw("t0", 0x10, "sp")            # live destination
+    a.addu("t1", "sp", "zero")        # converted source
+    a.addiu("t2", "zero", 8)
+
+    a.lab("copy_loop")
+    a.word(it(0x25, REG["t1"], REG["t3"], 0))  # lhu t3,0(t1)
+    a.word(it(0x29, REG["t0"], REG["t3"], 0))  # sh  t3,0(t0)
+    a.addiu("t1", "t1", 2)
+    a.addiu("t0", "t0", 2)
+    a.addiu("t2", "t2", -1)
+    a.bne("t2", "zero", "copy_loop"); a.nop()
+
+    a.word(it(0x29, REG["t0"], REG["zero"], 0))  # sh zero,0(t0)
+    a.lw("a2", 0x10, "sp")
+    a.word(jt(3, NAME_SCREEN_RUNTIME_ORIGINAL_TARGET)); a.nop()
+    a.lw("ra", 0x2C, "sp")
+    a.addiu("sp", "sp", 0x30)
+    a.word(rt(REG["ra"], 0, 0, 0, 8)); a.nop()  # jr ra
+    return a.out()
+
+
+def patch_name_screen_runtime_ascii_hook(exe, load, *, force=False, dry_run=False):
+    """Patch the live-name caller so ASCII memory-card names cannot hang."""
+    site_off = ram2off(NAME_SCREEN_RUNTIME_CALL_SITE, load)
+    if site_off < 0 or site_off + 4 > len(exe):
+        raise RuntimeError(
+            f"Rename runtime call site maps outside EXE: RAM 0x{NAME_SCREEN_RUNTIME_CALL_SITE:08X}, "
+            f"file 0x{site_off:X}"
+        )
+
+    current = read32(exe, site_off)
+    replacing_existing_hook = False
+    if current != NAME_SCREEN_RUNTIME_ORIGINAL_CALL_WORD:
+        is_jal = ((current >> 26) & 0x3F) == 0x03
+        target = ((NAME_SCREEN_RUNTIME_CALL_SITE + 4) & 0xF0000000) | ((current & 0x03FFFFFF) << 2)
+        in_appended_payload = BSS_END <= target < off2ram(len(exe), load)
+        if is_jal and in_appended_payload:
+            target_off = ram2off(target, load)
+            expected_existing = build_name_screen_runtime_ascii_wrapper(target)
+            if (
+                0 <= target_off <= len(exe) - len(expected_existing)
+                and bytes(exe[target_off:target_off + len(expected_existing)]) == expected_existing
+            ):
+                return {
+                    "enabled": True,
+                    "status": "already_applied",
+                    "site_ram": f"0x{NAME_SCREEN_RUNTIME_CALL_SITE:08X}",
+                    "site_file": f"0x{site_off:X}",
+                    "old_call_word": f"0x{current:08X}",
+                    "new_call_word": f"0x{current:08X}",
+                    "hook_ram": f"0x{target:08X}",
+                    "hook_file": f"0x{target_off:X}",
+                    "hook_len": len(expected_existing),
+                    "original_target": f"0x{NAME_SCREEN_RUNTIME_ORIGINAL_TARGET:08X}",
+                    "ascii_mapping": "A-Z,a-z,0-9,space; unsupported ASCII -> full-width space",
+                    "live_name_migrated_to_native_cp932": True,
+                }
+            replacing_existing_hook = True
+        elif not force:
+            raise RuntimeError(
+                f"Rename runtime call mismatch at file 0x{site_off:X}: found 0x{current:08X}, "
+                f"expected 0x{NAME_SCREEN_RUNTIME_ORIGINAL_CALL_WORD:08X}. "
+                "Use --name-screen-runtime-force only if this MAIN.EXE layout is intentional."
+            )
+
+    hook_off = align(len(exe), 4)
+    hook_ram = off2ram(hook_off, load)
+    code = build_name_screen_runtime_ascii_wrapper(hook_ram)
+
+    if not dry_run:
+        if len(exe) < hook_off:
+            exe += b"\0" * (hook_off - len(exe))
+        exe[site_off:site_off + 4] = w(jt(3, hook_ram))
+        exe[hook_off:hook_off + len(code)] = code
+
+    return {
+        "enabled": True,
+        "status": "would_patch" if dry_run else ("replaced_existing_hook" if replacing_existing_hook else "patched"),
+        "site_ram": f"0x{NAME_SCREEN_RUNTIME_CALL_SITE:08X}",
+        "site_file": f"0x{site_off:X}",
+        "old_call_word": f"0x{current:08X}",
+        "new_call_word": f"0x{jt(3, hook_ram):08X}",
+        "hook_ram": f"0x{hook_ram:08X}",
+        "hook_file": f"0x{hook_off:X}",
+        "hook_len": len(code),
+        "original_target": f"0x{NAME_SCREEN_RUNTIME_ORIGINAL_TARGET:08X}",
+        "ascii_mapping": "A-Z,a-z,0-9,space; unsupported ASCII -> full-width space",
+        "live_name_migrated_to_native_cp932": True,
     }
 
 
@@ -6871,7 +7078,7 @@ def write_pixy_name_suffix_report_csv(path: Path, rows: list[dict]) -> None:
             wri.writerow({k:rec.get(k,"") for k in fields})
 
 def main():
-    ap=argparse.ArgumentParser(description="PixyGarden MAIN.EXE patcher v108 based on working v108/safe v102/v97, with tuned guarded small grey selector-box FUN_80051780 hook and Pixy-name action/Modus suffix spacing fix enabled by default, rows 2-38 full-screen memory-card/status centering, locked Latin renderer metrics, Garden music-title hook, PLMENU01/PLSEL/TREE/REPORT fixes, and full grouped TUTO XA text patch")
+    ap=argparse.ArgumentParser(description="PixyGarden MAIN.EXE patcher v136 with complete name-screen compatibility, explicit native spacing for non-Latin CP932/Japanese glyphs, and all prior renderer/UI/archive fixes.")
     ap.add_argument("--exe",required=True); ap.add_argument("--xlsx",required=True); ap.add_argument("--out",required=True)
     ap.add_argument("--sheet",default="MAIN_EXE_Text"); ap.add_argument("--pointer-column"); ap.add_argument("--original-bytes-column"); ap.add_argument("--text-column")
     ap.add_argument("--dry-run",action="store_true")
@@ -7059,7 +7266,7 @@ def main():
     ap.add_argument("--modus-crest-template-color", type=lambda x:int(x,0), default=0x80, help="Modus Crest template RGB/color-byte guard. Default: 0x80")
     ap.add_argument("--ascii-map-json")
     ap.add_argument("--ascii-advance",type=int,default=12,help="Fallback/default advance for printable one-byte ASCII not assigned by an advance group. v73 default 12 keeps unspecified ASCII at original/Japanese-style spacing.")
-    ap.add_argument("--two-byte-advance",type=int,default=12,help="Legacy compatibility option. Non-Latin CP932 now uses the original parser/spacing by default, so this is not used unless you modify the hook behavior.")
+    ap.add_argument("--two-byte-advance",type=int,default=12,help="Advance used for non-Latin two-byte CP932/Japanese glyphs. Default 12 preserves native full-width spacing and prevents list views from inheriting compact Latin advances.")
     ap.add_argument("--space-advance",type=int,default=3)
     ap.add_argument("--punct-advance",type=int,default=3)
     ap.add_argument("--punct-chars",default=DEFAULT_PUNCT_CHARS,help="ASCII punctuation characters that use --punct-advance; full-width CP932 versions are mapped too")
@@ -7122,6 +7329,8 @@ def main():
     ap.add_argument("--ptr32-slice-count",type=int,default=1); ap.add_argument("--ptr32-slice-index",type=int,default=0)
     ap.add_argument("--align-strings",type=int,default=4)
     ap.add_argument("--disable-name-screen-fix",action="store_true",help="Disable the complete 42-entry Pixy rename-screen table fix")
+    ap.add_argument("--disable-name-screen-runtime-ascii-fix",action="store_true",help="Disable the v135 live ASCII-name migration wrapper used when opening the rename screen")
+    ap.add_argument("--name-screen-runtime-force",action="store_true",help="Patch the rename initializer call even if its current instruction is unexpected")
     ap.add_argument("--name-screen-exclude-offsets",default=NAME_SCREEN_DEFAULT_EXCLUDE_SPEC,help="Additional ptr32 file offsets to protect. The complete 42-entry table is protected automatically.")
     ap.add_argument("--name-screen-inplace-rows",default=NAME_SCREEN_DEFAULT_ROW_SPEC,help="Expected workbook rows for the 42 Pixy names (default: 233-274). Records are actually detected by original pointer, so shifted workbook rows remain safe.")
     ap.add_argument("--name-screen-inplace-fill",choices=["fixed_cp932_name8","fixed_cp932_space"],default="fixed_cp932_name8",help="Rename-table layout. Both accepted values write eight two-byte CP932 glyph cells followed by four zero bytes.")
@@ -7190,6 +7399,8 @@ def main():
     memory_card_centering_info = {"enabled": False, "status": "disabled", "report": []}
     pixy_name_suffix_info = {"enabled": False, "status": "disabled", "report": []}
     if args.ptr32_slice_count<1 or not (0<=args.ptr32_slice_index<args.ptr32_slice_count): raise ValueError("Bad slice args")
+    if not 0 <= int(args.two_byte_advance) <= 255:
+        raise ValueError("--two-byte-advance must be between 0 and 255")
     orig=Path(args.exe).read_bytes(); exe=bytearray(orig)
     if orig[:8]!=b"PS-X EXE": raise RuntimeError("Input is not PS-X EXE")
     load=struct.unpack_from("<I",orig,0x18)[0]; old_payload=struct.unpack_from("<I",orig,0x1c)[0]; pbase=load-PSX_HEADER
@@ -7217,6 +7428,7 @@ def main():
     name_fix_excludes=[]
     name_fix_inplace_report=[]
     name_fix_info={"enabled":False,"status":"disabled","report":[]}
+    name_runtime_fix_info={"enabled":False,"status":"disabled"}
     protected_name_rows=set()
     if not args.disable_name_screen_fix:
         protected_name_rows={r.sheet_row for r in rows if is_name_screen_row(r)}
@@ -7254,6 +7466,13 @@ def main():
             dry_run=args.dry_run,
         )
         name_fix_inplace_report=name_fix_info.get("report",[])
+    if not args.disable_name_screen_runtime_ascii_fix:
+        name_runtime_fix_info=patch_name_screen_runtime_ascii_hook(
+            exe,
+            load,
+            force=args.name_screen_runtime_force,
+            dry_run=args.dry_run,
+        )
     selector_gsbox_hook_info={"enabled":False,"status":"disabled","report":[]}
     clear_data_selector_y_info={"enabled":False,"status":"disabled","report":[]}
     report_text_info={"enabled":False,"status":"disabled"}
@@ -7402,7 +7621,7 @@ def main():
             write_pixy_name_suffix_report_csv(psr, pixy_name_suffix_info.get("report", []))
         if selector_gsbox_hook_info.get("enabled"):
             write_selector_gsbox_hook_report_csv(sgr, selector_gsbox_hook_info.get("report", []))
-        summary={"input":str(args.exe),"output":str(args.out),"rows":len(rows),"memory_card_centering":{k:v for k,v in memory_card_centering_info.items() if k != "report"},"memory_card_centering_report_rows":len(memory_card_centering_info.get("report",[])),"pixy_name_suffix_spacing":{k:v for k,v in pixy_name_suffix_info.items() if k != "report"},"pixy_name_suffix_spacing_report_rows":len(pixy_name_suffix_info.get("report",[])),"selector_gsbox_hook":{k:v for k,v in selector_gsbox_hook_info.items() if k != "report"},"selector_gsbox_hook_report_rows":len(selector_gsbox_hook_info.get("report",[])),"clear_data_selector_y":{k:v for k,v in clear_data_selector_y_info.items() if k != "report"},"clear_data_selector_y_report":clear_data_selector_y_info.get("report",[]),"old_file_size":len(orig),"new_file_size":len(exe),"old_payload":old_payload,"new_payload":new_payload,"ascii_table_ram":f"0x{table:08X}","ascii_stub_ram":f"0x{stub:08X}","ascii_xoff_table_ram":f"0x{xoff_table:08X}","pool_start_off":f"0x{pool:X}","pool_start_ram":f"0x{off2ram(pool,load):08X}","unpadded_size":unpadded,"loaded_end":f"0x{loaded_end:08X}","heap_base_minus4":f"0x{heap:08X}","legacy_lui_patches":lui_total,"direct_mips_sites":len(direct_report),"direct_mips_patched":sum(1 for r in direct_report if r.get("status") in {"patched","would_patch"}),"direct_mips_already_patched":sum(1 for r in direct_report if r.get("status")=="already_patched"),"direct_mips_errors":sum(1 for r in direct_report if r.get("status")=="error"),"direct_mips_confidence":args.direct_mips_confidence,"ptr32_policy":args.ptr32_policy,"ptr32_candidates_total":len(cands),"ptr32_selected_total":sum(1 for c in cands if c.selected),"ptr32_patches":ptr_total,"ptr32_cluster_gap":args.ptr32_cluster_gap,"ptr32_cluster_min":args.ptr32_cluster_min,"ptr32_cluster_unique_min":args.ptr32_cluster_unique_min,"ptr32_sections":args.ptr32_sections,"ptr32_slice_count":args.ptr32_slice_count,"ptr32_slice_index":args.ptr32_slice_index,"name_screen_fix_enabled":not args.disable_name_screen_fix,"name_screen_ptr32_excludes":len(name_fix_excludes),"name_screen_inplace_rows":len(name_fix_inplace_report),"name_screen_table_entries":name_fix_info.get("entries",0),"name_screen_slot_format":"8 CP932 glyph halfwords + 4 zero bytes" if name_fix_info.get("enabled") else None,"advance_groups":{"7":args.advance7_chars,"6":args.advance6_chars,"5":args.advance5_chars,"9":args.advance9_chars,"8":args.advance8_chars,"3":args.advance3_chars,"2":args.advance2_chars,"10":args.advance10_chars,"4":args.advance4_chars},"v75_final_spacing_lock":None if (args.disable_v74_final_spacing_lock or args.disable_v75_final_spacing_lock) else DEFAULT_V75_FINAL_ADVANCE_OVERRIDES,"effective_sample_advances":{"I":build_advance_table(args)[ord("I")],"i":build_advance_table(args)[ord("i")],"l":build_advance_table(args)[ord("l")],"p":build_advance_table(args)[ord("p")],"m":build_advance_table(args)[ord("m")],"M":build_advance_table(args)[ord("M")],"R":build_advance_table(args)[ord("R")],"P":build_advance_table(args)[ord("P")],"u":build_advance_table(args)[ord("u")],"w":build_advance_table(args)[ord("w")],"period":build_advance_table(args)[ord(".")],"z":build_advance_table(args)[ord("z")]} ,"font_tim_metrics":load_v76_font_tim_metrics(args),"x_offsets":{"left2":args.xoff_left2_chars,"left1":args.xoff_left1_chars,"right3":args.xoff_right3_chars,"right2":args.xoff_right2_chars,"right1":args.xoff_right1_chars,"draw_shift":args.draw_shift,"v75_final":iter_v75_final_xoff_map(args),"pair_kern":iter_v75_pair_kern_map(args)},"capital_r_advance_delta":args.capital_r_advance_delta,"uppercase_advance_delta":args.uppercase_advance_delta,"hyphen_advance_delta":args.hyphen_advance_delta,"slash_advance_delta":args.slash_advance_delta,"paren_advance":args.paren_advance,"slash_fixed_advance":args.slash_fixed_advance,"space_advance":args.space_advance,"punct_advance":args.punct_advance,"two_byte_advance_legacy_unused":args.two_byte_advance,"nonlatin_cp932_spacing":"original_parser","tree_text_buffer_patch_enabled":tree_buffer_info.get("enabled",False),"tree_copy_limit":f"0x{tree_buffer_info.get('copy_limit',0):X}" if tree_buffer_info.get("enabled") else None,"tree_clear_size":f"0x{tree_buffer_info.get('clear_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_frame_size":f"0x{tree_buffer_info.get('frame_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_terminator_patch_enabled":tree_terminator_info.get("enabled",False),"tree_terminator":tree_terminator_info.get("terminator") if tree_terminator_info.get("enabled") else "0x39","planet_stage_terminator_patch_enabled":planet_stage_terminator_info.get("enabled",False),"planet_stage_terminator":planet_stage_terminator_info.get("terminator") if planet_stage_terminator_info.get("enabled") else "0x39","plsel_graphic_draw_patch_enabled":plsel_graphic_draw_info.get("enabled",False),"plsel_graphic_draw_patch_sites":len(plsel_graphic_draw_info.get("report",[])),"plsel_graphic_draw_patch_report":plsel_graphic_draw_info.get("report",[]),"planet_title_ram_hook_enabled":planet_title_info.get("enabled",False),"planet_title_ram_hook_status":planet_title_info.get("status"),"planet_title_ram_hook_site":planet_title_info.get("site_file"),"planet_title_ram_hook_addr":planet_title_info.get("hook_ram"),"planet_title_ram_hook_titles":" | ".join(planet_title_info.get("titles",[])) if planet_title_info.get("titles") else None,"planet_title_ram_hook_text_area":{"x":planet_title_info.get("text_x"),"y":planet_title_info.get("title_y"),"w":planet_title_info.get("text_w"),"slot_h":planet_title_info.get("slot_h"),"slot_pitch":planet_title_info.get("slot_pitch")} if planet_title_info.get("enabled") else None,"planet_info_element_draw_patch_enabled":planet_info_element_info.get("enabled",False),"planet_info_element_draw_patch_status":planet_info_element_info.get("status"),"planet_info_element_draw_patch_hook":planet_info_element_info.get("hook_ram"),"planet_info_element_draw_patch_report":planet_info_element_info.get("report",[]),"planet_copy_slot_split_hook":planet_copy_slot_split_info,"stage_tim03_moved_uv_patch":stage_tim03_uv_info,"stage_tim04_na_packet_filter_hook":stage_tim04_na_packet_filter_info,"stage_tim04_na_ft4_edge_filter_hook":stage_tim04_na_ft4_edge_filter_info,"stage_tim04_na_ft4_source_filter_hook":stage_tim04_na_ft4_source_filter_info,"stage_tim04_na_template_u_hook":stage_tim04_na_template_u_info,"modus_local_record_early_fix_hook":modus_local_record_early_fix_info,"modus_local_record_fix_hook":modus_local_record_fix_info,"stage_tim04_object_overlay_na_x":args.stage_tim04_object_overlay_na_x,"modus_plmenu01_uvs":{"Earth":"visible x=25 w=23; padded U=0x18 W=0x19","Water":"visible x=50 w=24; padded U=0x31 W=0x1A","Wind":"visible x=76 w=19; padded U=0x4B W=0x15","Fire":"visible x=97 w=18; padded U=0x60 W=0x14"},"modus_plmenu01_ft4_uvs":{"Earth":"U=0x19 W=0x17","Water":"U=0x32 W=0x18","Wind":"U=0x4C W=0x13","Fire":"U=0x61 W=0x12"},"modus_ft4_x_tolerance":args.modus_stage_ft4_x_tolerance,"modus_ft4_source_aliases":"v35 matches stock, steady padded, and FT4 visible U values","ft4_opening_repairs_v43":"Object Overlay relocation-only old-U->edited-U/W/X; PLANET/Modus element first-UV/edge repairs mirror stable template values","modus_exact_ft4_edge_read_hooks":modus_exact_ft4_edge_read_info,"stage_tim04_object_overlay_base_x":args.stage_tim04_object_overlay_base_x,"tuto21_flow":tuto21_info,"planet_info_planet_clut":args.planet_info_planet_clut,"planet_title_tracking":args.planet_title_tracking,"planet_title_bitmap_metrics_enabled":planet_title_use_bitmap_metrics(args),"planet_title_bitmap_tracking":args.planet_title_bitmap_tracking,"planet_title_space_advance":args.planet_title_space_advance,"planet_title_advance_delta":args.planet_title_advance_delta,"planet_title_advance_override":args.planet_title_advance_override,"report_text_patch_enabled":report_text_info.get("enabled",False),"report_text_patch_status":report_text_info.get("status"),"report_text_patch_offset":report_text_info.get("file_offset"),"text_primitive_capacity_patch_enabled":text_primitive_info.get("enabled",False),"text_primitive_capacity_glyphs":text_primitive_info.get("capacity_glyphs"),"text_primitive_half_size":f"0x{text_primitive_info.get('half_size',0):X}" if text_primitive_info.get("enabled") else None,"text_primitive_alloc_size":f"0x{text_primitive_info.get('alloc_size',0):X}" if text_primitive_info.get("enabled") else None}
+        summary={"input":str(args.exe),"output":str(args.out),"rows":len(rows),"memory_card_centering":{k:v for k,v in memory_card_centering_info.items() if k != "report"},"memory_card_centering_report_rows":len(memory_card_centering_info.get("report",[])),"pixy_name_suffix_spacing":{k:v for k,v in pixy_name_suffix_info.items() if k != "report"},"pixy_name_suffix_spacing_report_rows":len(pixy_name_suffix_info.get("report",[])),"selector_gsbox_hook":{k:v for k,v in selector_gsbox_hook_info.items() if k != "report"},"selector_gsbox_hook_report_rows":len(selector_gsbox_hook_info.get("report",[])),"clear_data_selector_y":{k:v for k,v in clear_data_selector_y_info.items() if k != "report"},"clear_data_selector_y_report":clear_data_selector_y_info.get("report",[]),"old_file_size":len(orig),"new_file_size":len(exe),"old_payload":old_payload,"new_payload":new_payload,"ascii_table_ram":f"0x{table:08X}","ascii_stub_ram":f"0x{stub:08X}","ascii_xoff_table_ram":f"0x{xoff_table:08X}","pool_start_off":f"0x{pool:X}","pool_start_ram":f"0x{off2ram(pool,load):08X}","unpadded_size":unpadded,"loaded_end":f"0x{loaded_end:08X}","heap_base_minus4":f"0x{heap:08X}","legacy_lui_patches":lui_total,"direct_mips_sites":len(direct_report),"direct_mips_patched":sum(1 for r in direct_report if r.get("status") in {"patched","would_patch"}),"direct_mips_already_patched":sum(1 for r in direct_report if r.get("status")=="already_patched"),"direct_mips_errors":sum(1 for r in direct_report if r.get("status")=="error"),"direct_mips_confidence":args.direct_mips_confidence,"ptr32_policy":args.ptr32_policy,"ptr32_candidates_total":len(cands),"ptr32_selected_total":sum(1 for c in cands if c.selected),"ptr32_patches":ptr_total,"ptr32_cluster_gap":args.ptr32_cluster_gap,"ptr32_cluster_min":args.ptr32_cluster_min,"ptr32_cluster_unique_min":args.ptr32_cluster_unique_min,"ptr32_sections":args.ptr32_sections,"ptr32_slice_count":args.ptr32_slice_count,"ptr32_slice_index":args.ptr32_slice_index,"name_screen_fix_enabled":not args.disable_name_screen_fix,"name_screen_ptr32_excludes":len(name_fix_excludes),"name_screen_inplace_rows":len(name_fix_inplace_report),"name_screen_table_entries":name_fix_info.get("entries",0),"name_screen_slot_format":"8 CP932 glyph halfwords + 4 zero bytes" if name_fix_info.get("enabled") else None,"name_screen_runtime_ascii_fix":name_runtime_fix_info,"advance_groups":{"7":args.advance7_chars,"6":args.advance6_chars,"5":args.advance5_chars,"9":args.advance9_chars,"8":args.advance8_chars,"3":args.advance3_chars,"2":args.advance2_chars,"10":args.advance10_chars,"4":args.advance4_chars},"v75_final_spacing_lock":None if (args.disable_v74_final_spacing_lock or args.disable_v75_final_spacing_lock) else DEFAULT_V75_FINAL_ADVANCE_OVERRIDES,"effective_sample_advances":{"I":build_advance_table(args)[ord("I")],"i":build_advance_table(args)[ord("i")],"l":build_advance_table(args)[ord("l")],"p":build_advance_table(args)[ord("p")],"m":build_advance_table(args)[ord("m")],"M":build_advance_table(args)[ord("M")],"R":build_advance_table(args)[ord("R")],"P":build_advance_table(args)[ord("P")],"u":build_advance_table(args)[ord("u")],"w":build_advance_table(args)[ord("w")],"period":build_advance_table(args)[ord(".")],"z":build_advance_table(args)[ord("z")]} ,"font_tim_metrics":load_v76_font_tim_metrics(args),"x_offsets":{"left2":args.xoff_left2_chars,"left1":args.xoff_left1_chars,"right3":args.xoff_right3_chars,"right2":args.xoff_right2_chars,"right1":args.xoff_right1_chars,"draw_shift":args.draw_shift,"v75_final":iter_v75_final_xoff_map(args),"pair_kern":iter_v75_pair_kern_map(args)},"capital_r_advance_delta":args.capital_r_advance_delta,"uppercase_advance_delta":args.uppercase_advance_delta,"hyphen_advance_delta":args.hyphen_advance_delta,"slash_advance_delta":args.slash_advance_delta,"paren_advance":args.paren_advance,"slash_fixed_advance":args.slash_fixed_advance,"space_advance":args.space_advance,"punct_advance":args.punct_advance,"two_byte_advance_legacy_unused":args.two_byte_advance,"nonlatin_cp932_spacing":f"explicit_{args.two_byte_advance}px","tree_text_buffer_patch_enabled":tree_buffer_info.get("enabled",False),"tree_copy_limit":f"0x{tree_buffer_info.get('copy_limit',0):X}" if tree_buffer_info.get("enabled") else None,"tree_clear_size":f"0x{tree_buffer_info.get('clear_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_frame_size":f"0x{tree_buffer_info.get('frame_size',0):X}" if tree_buffer_info.get("enabled") else None,"tree_terminator_patch_enabled":tree_terminator_info.get("enabled",False),"tree_terminator":tree_terminator_info.get("terminator") if tree_terminator_info.get("enabled") else "0x39","planet_stage_terminator_patch_enabled":planet_stage_terminator_info.get("enabled",False),"planet_stage_terminator":planet_stage_terminator_info.get("terminator") if planet_stage_terminator_info.get("enabled") else "0x39","plsel_graphic_draw_patch_enabled":plsel_graphic_draw_info.get("enabled",False),"plsel_graphic_draw_patch_sites":len(plsel_graphic_draw_info.get("report",[])),"plsel_graphic_draw_patch_report":plsel_graphic_draw_info.get("report",[]),"planet_title_ram_hook_enabled":planet_title_info.get("enabled",False),"planet_title_ram_hook_status":planet_title_info.get("status"),"planet_title_ram_hook_site":planet_title_info.get("site_file"),"planet_title_ram_hook_addr":planet_title_info.get("hook_ram"),"planet_title_ram_hook_titles":" | ".join(planet_title_info.get("titles",[])) if planet_title_info.get("titles") else None,"planet_title_ram_hook_text_area":{"x":planet_title_info.get("text_x"),"y":planet_title_info.get("title_y"),"w":planet_title_info.get("text_w"),"slot_h":planet_title_info.get("slot_h"),"slot_pitch":planet_title_info.get("slot_pitch")} if planet_title_info.get("enabled") else None,"planet_info_element_draw_patch_enabled":planet_info_element_info.get("enabled",False),"planet_info_element_draw_patch_status":planet_info_element_info.get("status"),"planet_info_element_draw_patch_hook":planet_info_element_info.get("hook_ram"),"planet_info_element_draw_patch_report":planet_info_element_info.get("report",[]),"planet_copy_slot_split_hook":planet_copy_slot_split_info,"stage_tim03_moved_uv_patch":stage_tim03_uv_info,"stage_tim04_na_packet_filter_hook":stage_tim04_na_packet_filter_info,"stage_tim04_na_ft4_edge_filter_hook":stage_tim04_na_ft4_edge_filter_info,"stage_tim04_na_ft4_source_filter_hook":stage_tim04_na_ft4_source_filter_info,"stage_tim04_na_template_u_hook":stage_tim04_na_template_u_info,"modus_local_record_early_fix_hook":modus_local_record_early_fix_info,"modus_local_record_fix_hook":modus_local_record_fix_info,"stage_tim04_object_overlay_na_x":args.stage_tim04_object_overlay_na_x,"modus_plmenu01_uvs":{"Earth":"visible x=25 w=23; padded U=0x18 W=0x19","Water":"visible x=50 w=24; padded U=0x31 W=0x1A","Wind":"visible x=76 w=19; padded U=0x4B W=0x15","Fire":"visible x=97 w=18; padded U=0x60 W=0x14"},"modus_plmenu01_ft4_uvs":{"Earth":"U=0x19 W=0x17","Water":"U=0x32 W=0x18","Wind":"U=0x4C W=0x13","Fire":"U=0x61 W=0x12"},"modus_ft4_x_tolerance":args.modus_stage_ft4_x_tolerance,"modus_ft4_source_aliases":"v35 matches stock, steady padded, and FT4 visible U values","ft4_opening_repairs_v43":"Object Overlay relocation-only old-U->edited-U/W/X; PLANET/Modus element first-UV/edge repairs mirror stable template values","modus_exact_ft4_edge_read_hooks":modus_exact_ft4_edge_read_info,"stage_tim04_object_overlay_base_x":args.stage_tim04_object_overlay_base_x,"tuto21_flow":tuto21_info,"planet_info_planet_clut":args.planet_info_planet_clut,"planet_title_tracking":args.planet_title_tracking,"planet_title_bitmap_metrics_enabled":planet_title_use_bitmap_metrics(args),"planet_title_bitmap_tracking":args.planet_title_bitmap_tracking,"planet_title_space_advance":args.planet_title_space_advance,"planet_title_advance_delta":args.planet_title_advance_delta,"planet_title_advance_override":args.planet_title_advance_override,"report_text_patch_enabled":report_text_info.get("enabled",False),"report_text_patch_status":report_text_info.get("status"),"report_text_patch_offset":report_text_info.get("file_offset"),"text_primitive_capacity_patch_enabled":text_primitive_info.get("enabled",False),"text_primitive_capacity_glyphs":text_primitive_info.get("capacity_glyphs"),"text_primitive_half_size":f"0x{text_primitive_info.get('half_size',0):X}" if text_primitive_info.get("enabled") else None,"text_primitive_alloc_size":f"0x{text_primitive_info.get('alloc_size',0):X}" if text_primitive_info.get("enabled") else None}
         sj.write_text(json.dumps(summary,indent=2),encoding="utf-8")
     print("PixyGarden conservative namefix patch summary")
     print("----------------------------------------")
@@ -7420,6 +7639,8 @@ def main():
         print(f"Name fix ptr32 excludes: {len(name_fix_excludes)}")
         print(f"Name table entries fixed: {len(name_fix_inplace_report)} / {NAME_SCREEN_ENTRY_COUNT}")
         print("Name slot format:         8 CP932 glyphs + 4 zero bytes")
+    if name_runtime_fix_info.get("enabled"):
+        print(f"Name runtime ASCII fix:  {name_runtime_fix_info.get('status')} at {name_runtime_fix_info.get('site_ram')}")
     if tree_buffer_info.get("enabled"):
         print(f"TREE copy limit:         0x{tree_buffer_info['copy_limit']:X}")
         print(f"TREE frame size:         0x{tree_buffer_info['frame_size']:X}")
