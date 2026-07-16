@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Optional
 
 # PixyGarden SCR Repacker
+# v12: preserves the original two-byte SCR record alignment invariant.
+#      Odd-length c7 dialogue records receive one trailing 00 byte, branch
+#      targets are recalculated, and final alignment is validated strictly.
+#      Adds --repair-alignment for already-translated SCR/EVENT.CDF files.
 # v11: EVENT.CDF-safe template mode; uses original CDF SCR structure/control bytes and replaces text only.
 #
 # Known/assumed SCR structure from E001.SCR:
@@ -296,10 +300,18 @@ def _iter_replacement_rows_table(path: Path):
             with path.open("r", encoding=enc, newline="") as f:
                 sample = f.read(4096)
                 f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
-                except csv.Error:
-                    dialect = csv.excel_tab if "\t" in sample and "," not in sample else csv.excel
+                # Use the standard dialect for known file extensions. Sniffer
+                # can incorrectly set doublequote=False when translated text
+                # contains quotation marks, corrupting CSV fields on import.
+                if suffix == ".csv":
+                    dialect = csv.excel
+                elif suffix in {".tsv", ".tab"}:
+                    dialect = csv.excel_tab
+                else:
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+                    except csv.Error:
+                        dialect = csv.excel_tab if "\t" in sample and "," not in sample else csv.excel
                 reader = csv.DictReader(f, dialect=dialect)
                 if not reader.fieldnames:
                     return
@@ -504,6 +516,105 @@ def build_records_with_replacements(
     return new_records, report
 
 
+def _recalculate_report_offsets(records: list[Record], report: list[RepackReportRow]) -> int:
+    """Refresh report offsets/lengths after alignment padding changes records."""
+    report_by_idx = {row.record_index: row for row in report}
+    cur = 0
+    for rec in records:
+        row = report_by_idx.get(rec.index)
+        if row is not None:
+            row.new_offset = cur
+            row.new_length = rec.total_len
+        cur += rec.total_len
+    return cur
+
+
+def enforce_two_byte_dialogue_alignment(
+    records: list[Record],
+    report: list[RepackReportRow],
+    *,
+    text_opcode: int,
+    terminator: int,
+    context: str = "",
+) -> int:
+    """Pad odd-length c7 dialogue records so every SCR record stays even.
+
+    The original EVENT scripts place every record on a two-byte boundary. MAIN
+    reads several command operands with LHU, so allowing translated text to make
+    a record odd can produce a real PS1 AdEL exception. Padding is placed after
+    the existing dialogue terminator/tail and is therefore outside displayed text.
+    """
+    report_by_idx = {row.record_index: row for row in report}
+    padded = 0
+
+    for rec in records:
+        if rec.total_len % 2 == 0:
+            continue
+
+        if rec.opcode != (text_opcode & 0xFF) or not has_c7_prefix(rec.payload, terminator):
+            prefix = f"{context}: " if context else ""
+            raise ValueError(
+                f"{prefix}record {rec.index} at old offset 0x{rec.old_offset:04X} "
+                f"has odd total length 0x{rec.total_len:X}, but it is not a c7 dialogue record. "
+                "Rebuild aborted rather than guessing how to pad a control command."
+            )
+
+        if rec.total_len >= 0xFF:
+            prefix = f"{context}: " if context else ""
+            raise ValueError(
+                f"{prefix}dialogue record {rec.index} at old offset 0x{rec.old_offset:04X} "
+                "is 0xFF bytes and cannot accept the required alignment byte."
+            )
+
+        rec.payload += b"\x00"
+        rec.length = rec.total_len
+        padded += 1
+
+        row = report_by_idx.get(rec.index)
+        _mark_report_status(row, "alignment_padding_added")
+        _append_report_note(row, "appended_00_for_two_byte_record_alignment")
+
+    _recalculate_report_offsets(records, report)
+    return padded
+
+
+def validate_scr_alignment(
+    records: list[Record],
+    *,
+    jump_opcodes: set[int],
+    conditional_jump_opcodes: set[int],
+    tail_start: int,
+    context: str = "",
+) -> None:
+    """Require even record starts/lengths and aligned 16-bit branch operands."""
+    target_opcodes = _branch_target_opcodes(jump_opcodes, conditional_jump_opcodes)
+    boundaries = {rec.old_offset for rec in records}
+    boundaries.add(tail_start)
+    errors: list[str] = []
+
+    for rec in records:
+        if rec.old_offset & 1:
+            errors.append(f"rec{rec.index}_odd_start_0x{rec.old_offset:04X}")
+        if rec.total_len & 1:
+            errors.append(f"rec{rec.index}_odd_length_0x{rec.total_len:02X}")
+        if rec.opcode in target_opcodes and len(rec.payload) >= 2:
+            operand_offset = rec.old_offset + 2
+            if operand_offset & 1:
+                errors.append(f"rec{rec.index}_odd_branch_operand_0x{operand_offset:04X}")
+            target = int.from_bytes(rec.payload[:2], "little")
+            if target not in boundaries:
+                errors.append(f"rec{rec.index}_invalid_target_0x{target:04X}")
+
+    if tail_start & 1:
+        errors.append(f"odd_tail_start_0x{tail_start:04X}")
+
+    if errors:
+        prefix = f"{context}: " if context else ""
+        sample = ", ".join(errors[:12])
+        more = "" if len(errors) <= 12 else f" (+{len(errors)-12} more)"
+        raise ValueError(f"{prefix}SCR alignment validation failed: {sample}{more}")
+
+
 def _append_report_note(row: Optional[RepackReportRow], msg: str) -> None:
     if row is None:
         return
@@ -556,6 +667,8 @@ def update_branch_targets(
     jump_opcodes: set[int],
     conditional_jump_opcodes: set[int],
     strict_targets: bool,
+    old_tail_start: Optional[int] = None,
+    new_tail_start: Optional[int] = None,
     auto_fix_near_targets: bool = True,
     near_target_delta: int = 1,
 ) -> None:
@@ -568,6 +681,8 @@ def update_branch_targets(
       small near-boundary errors before mapping to the new boundary.
     """
     old_to_new = {old.old_offset: row.new_offset for old, row in zip(old_records, report)}
+    if old_tail_start is not None and new_tail_start is not None:
+        old_to_new[old_tail_start] = new_tail_start
     old_boundaries = set(old_to_new)
     report_by_idx = {r.record_index: r for r in report}
     target_opcodes = _branch_target_opcodes(jump_opcodes, conditional_jump_opcodes)
@@ -1103,8 +1218,19 @@ def repack_scr_data(
     jump_opcodes = parse_byte_list(args.jump_opcodes)
     conditional_jump_opcodes = parse_byte_list(args.conditional_jump_opcodes)
 
-    # v5: run branch update even when preserving record lengths, because a
-    # previously built SCR can already contain a near-boundary target error.
+    old_tail_start = sum(rec.total_len for rec in records)
+    alignment_count = enforce_two_byte_dialogue_alignment(
+        new_records,
+        report_rows,
+        text_opcode=args.text_opcode & 0xFF,
+        terminator=args.terminator & 0xFF,
+        context=scr_name,
+    )
+    _new_offsets, new_tail_start = _record_new_offsets(new_records)
+
+    # Run branch update even when preserving record lengths or repairing an
+    # already-translated SCR. Include the parsed tail/terminator boundary in the
+    # old-to-new map because some scripts branch directly to script end.
     update_branch_targets(
         records,
         new_records,
@@ -1112,6 +1238,8 @@ def repack_scr_data(
         jump_opcodes=jump_opcodes,
         conditional_jump_opcodes=conditional_jump_opcodes,
         strict_targets=args.strict_targets,
+        old_tail_start=old_tail_start,
+        new_tail_start=new_tail_start,
         auto_fix_near_targets=getattr(args, "auto_fix_near_targets", True),
         near_target_delta=getattr(args, "near_target_delta", 1),
     )
@@ -1148,6 +1276,19 @@ def repack_scr_data(
     if final_bad and getattr(args, "final_strict_targets", True):
         sample = ", ".join(f"rec{idx}@0x{off:04X}->0x{target:04X}" for idx, off, op, target in final_bad[:8])
         raise ValueError(f"{scr_name}: final serialized SCR has branch targets not on command boundaries: {sample}")
+
+    # Alignment is a release-critical invariant and is always validated, even
+    # when optional branch strictness flags are disabled.
+    validate_scr_alignment(
+        final_records,
+        jump_opcodes=jump_opcodes,
+        conditional_jump_opcodes=conditional_jump_opcodes,
+        tail_start=final_tail_start,
+        context=scr_name,
+    )
+
+    if alignment_count:
+        print(f"{scr_name}: added {alignment_count} two-byte alignment padding byte(s)")
 
     replaced_count = sum(1 for r in report_rows if "text_replaced" in r.status)
     branch_count = sum(
@@ -1212,7 +1353,7 @@ def handle_event_cdf_mode(args) -> int:
             continue
         parsed_items.append((template_event_path, e.name, records))
 
-    print("PixyGarden SCR tool v11 EVENT.CDF-safe mode")
+    print("PixyGarden SCR tool v12 alignment-safe EVENT.CDF mode")
     print("-------------------------------------------")
     print(f"Base EVENT.CDF:     {base_event_path}")
     print(f"Template EVENT.CDF: {template_event_path}")
@@ -1230,21 +1371,32 @@ def handle_event_cdf_mode(args) -> int:
         print(f"Wrote combined text template: {args.extract_text_csv}")
         print(f"Text rows written: {count_rows}")
 
-    if args.replacements_csv:
+    if args.replacements_csv or args.repair_alignment:
         if not args.out_event_cdf:
-            raise SystemExit("--out-event-cdf is required when rebuilding an EVENT.CDF.")
+            raise SystemExit("--out-event-cdf is required when rebuilding or repairing an EVENT.CDF.")
 
-        by_scr, global_repl = load_replacements_multi(
-            Path(args.replacements_csv),
-            blank_means_keep=not args.blank_means_empty,
-        )
+        if args.replacements_csv:
+            by_scr, global_repl = load_replacements_multi(
+                Path(args.replacements_csv),
+                blank_means_keep=not args.blank_means_empty,
+            )
+            rebuild_data = template_data
+            rebuild_entries = template_scr_entries
+        else:
+            # Repair the current translated CDF directly. Do not switch to an
+            # original template here, because doing so would discard its text.
+            by_scr, global_repl = {}, {}
+            rebuild_data = base_data
+            rebuild_entries = [e for e in base_entries if e.name.upper().endswith(".SCR")]
+            if getattr(args, "template_event_cdf", None):
+                print("NOTE: --template-event-cdf is ignored in repair-only mode; repairing --event-cdf directly.")
 
         new_entry_data: dict[str, bytes] = {}
         scr_reports: list[tuple[str, int, int, int, int, list[RepackReportRow]]] = []
         cdf_rows: list[dict[str, object]] = []
 
-        for template_e in template_scr_entries:
-            old_blob = cdf_entry_data(template_data, template_e)
+        for template_e in rebuild_entries:
+            old_blob = cdf_entry_data(rebuild_data, template_e)
             base_e = base_by_name[template_e.name]
             replacements = replacements_for_scr(template_e.name, by_scr, global_repl)
 
@@ -1311,8 +1463,8 @@ def handle_event_cdf_mode(args) -> int:
         print(f"Total text records replaced:  {sum(x[3] for x in scr_reports)}")
         print(f"Total branch target changes:  {sum(x[4] for x in scr_reports)}")
 
-    if not args.extract_text_csv and not args.replacements_csv:
-        print("No action requested. Use --extract-text-csv and/or --replacements-csv.")
+    if not args.extract_text_csv and not args.replacements_csv and not args.repair_alignment:
+        print("No action requested. Use --extract-text-csv, --replacements-csv, and/or --repair-alignment.")
     return 0
 
 
@@ -1329,6 +1481,8 @@ def main() -> int:
     ap.add_argument("--out-dir", help="Output directory for multi-SCR rebuild mode")
     ap.add_argument("--extract-text-csv", help="Write extracted text template CSV. Multi mode writes one combined CSV with scr_file column.")
     ap.add_argument("--replacements-csv", help="CSV/XLSX containing translations to insert")
+    ap.add_argument("--repair-alignment", action="store_true",
+                    help="Rebuild existing SCR text in place, adding required two-byte dialogue padding even without a replacement file.")
     ap.add_argument("--report", help="Write rebuild report CSV for single-SCR mode")
     ap.add_argument("--report-dir", help="Directory for per-SCR reports in multi-SCR mode")
 
@@ -1362,7 +1516,7 @@ def main() -> int:
                     help="Abort when an original branch target cannot be mapped to a parsed command boundary.")
     ap.add_argument("--strict-final-targets", dest="final_strict_targets", action="store_true",
                     help="Abort if the rebuilt SCR still has branch-like targets that miss command boundaries after near-target auto-fix.")
-    ap.set_defaults(final_strict_targets=False)
+    ap.set_defaults(final_strict_targets=True)
     ap.add_argument("--no-auto-fix-near-targets", dest="auto_fix_near_targets", action="store_false",
                     help="Disable automatic repair of branch targets that are off by a small number of bytes.")
     ap.set_defaults(auto_fix_near_targets=True)
@@ -1390,8 +1544,8 @@ def main() -> int:
     if not parsed_items:
         raise SystemExit("No valid SCR files parsed.")
 
-    print("PixyGarden SCR tool v4")
-    print("----------------------")
+    print("PixyGarden SCR tool v12 alignment-safe mode")
+    print("-------------------------------------------")
     print(f"SCR files parsed: {len(parsed_items)}")
 
     if args.extract_text_csv:
@@ -1399,8 +1553,11 @@ def main() -> int:
         print(f"Wrote combined text template: {args.extract_text_csv}")
         print(f"Text rows written: {count}")
 
-    if args.replacements_csv:
-        by_scr, global_repl = load_replacements_multi(Path(args.replacements_csv), blank_means_keep=not args.blank_means_empty)
+    if args.replacements_csv or args.repair_alignment:
+        if args.replacements_csv:
+            by_scr, global_repl = load_replacements_multi(Path(args.replacements_csv), blank_means_keep=not args.blank_means_empty)
+        else:
+            by_scr, global_repl = {}, {}
         multi = len(parsed_items) > 1 or args.scr_dir or args.scr_glob
         if multi and not args.out_dir:
             raise SystemExit("--out-dir is required when rebuilding multiple SCR files.")
@@ -1430,8 +1587,8 @@ def main() -> int:
         if args.dry_run:
             print("Dry run: no rebuilt SCR files written.")
 
-    if not args.extract_text_csv and not args.replacements_csv:
-        print("No action requested. Use --extract-text-csv and/or --replacements-csv.")
+    if not args.extract_text_csv and not args.replacements_csv and not args.repair_alignment:
+        print("No action requested. Use --extract-text-csv, --replacements-csv, and/or --repair-alignment.")
     return 0
 
 
